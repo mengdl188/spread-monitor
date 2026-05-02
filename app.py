@@ -5,7 +5,6 @@ import numpy as np
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
-import requests
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -30,16 +29,15 @@ SYMBOL_MAP = {
     'SI': '工业硅', 'LC': '碳酸锂',
 }
 
-# 交易所与公告链接映射
-EXCHANGE_INFO = {
-    'SHFE': {'name': '上海期货交易所', 'announce': 'https://www.shfe.com.cn/news/notice/'},
-    'DCE': {'name': '大连商品交易所', 'announce': 'https://www.dce.com.cn/dalianshangpin/gywm/gsggx/csywgz/index.html'},
-    'CZCE': {'name': '郑州商品交易所', 'announce': 'https://www.czce.com.cn/cn/gywm/ggtg/csywgg/'},
-    'GFEX': {'name': '广州期货交易所', 'announce': 'https://www.gfex.com.cn/gfex/gywm/gsgg/'},
+# 交易所固定链接
+EXCHANGE_LINKS = {
+    'SHFE': 'https://www.shfe.com.cn/news/notice/',
+    'DCE': 'https://www.dce.com.cn/dalianshangpin/gywm/gsggx/csywgz/index.html',
+    'CZCE': 'https://www.czce.com.cn/cn/gywm/ggtg/csywgg/',
+    'GFEX': 'https://www.gfex.com.cn/gfex/gywm/gsgg/',
 }
 
-def get_exchange(sym):
-    """根据品种代码返回交易所简称"""
+def get_exchange_key(sym):
     if sym in ('CU','AL','ZN','PB','NI','SN','AU','AG','RB','HC','SS','BU','RU','NR','SP','FU','SC','BC','AO','BR'):
         return 'SHFE'
     elif sym in ('C','CS','A','B','M','Y','P','L','V','PP','EB','EG','PG','JM','J','I','JD','LH','RR'):
@@ -332,54 +330,6 @@ def get_inventory_info(sym):
         pass
     return None
 
-# ------------------ 交易所公告抓取 -----------------
-def get_exchange_announcements(sym):
-    """尝试抓取对应交易所公告标题，筛选含品种中文名的公告"""
-    cn_name = SYMBOL_MAP.get(sym, sym)
-    exchange = get_exchange(sym)
-    info = EXCHANGE_INFO.get(exchange)
-    if not info:
-        return None
-    url = info['announce']
-    try:
-        from bs4 import BeautifulSoup
-        resp = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-        resp.encoding = resp.apparent_encoding
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        titles = []
-        for a in soup.find_all('a', href=True):
-            text = a.get_text(strip=True)
-            if any(kw in text for kw in [cn_name, '仓单', '持仓限额', '交割', '调整']):
-                link = a['href']
-                if not link.startswith('http'):
-                    link = url.rstrip('/') + '/' + link.lstrip('/')
-                titles.append({'title': text, 'link': link})
-        if titles:
-            return titles[:5]
-    except:
-        pass
-    return None
-
-# ------------------ 新闻 (东方财富接口) -----------------
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_news(sym_name):
-    try:
-        url = "https://np-listapi.eastmoney.com/comm/web/getNewsByColumnId"
-        params = {
-            "columnId": "1023",
-            "pageNum": 1,
-            "pageSize": 5,
-            "keyword": sym_name
-        }
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(url, params=params, headers=headers, timeout=5)
-        data = resp.json()
-        if data.get('result') and data['result'].get('data'):
-            return data['result']['data']
-        return None
-    except:
-        return None
-
 # ------------------------------ 侧边栏 ------------------------------
 with st.sidebar:
     st.header("🔍 品种筛选")
@@ -522,13 +472,6 @@ if st.session_state.results is not None:
                 else:
                     st.caption("暂无库存数据")
 
-                # ---------- 基本面链接 ----------
-                exchange = get_exchange(r['sym'])
-                info = EXCHANGE_INFO.get(exchange, {})
-                st.write("---")
-                st.subheader("🔗 基本面查询")
-                st.markdown(f"- 📋 [{info.get('name','')}仓单/库存/公告]({info.get('announce','#')})")
-
                 # ---------- 综合研判 ----------
                 st.write("---")
                 st.subheader("🎯 综合研判 (Z-score & 库存评分)")
@@ -587,26 +530,11 @@ if st.session_state.results is not None:
                 elif color == 'green': st.success(conclusion)
                 else: st.info(conclusion)
 
-                # 新闻 / 公告
+                # 公告链接
                 st.write("---")
-                st.subheader("📰 近期公告/新闻")
-                cn_name = SYMBOL_MAP.get(r['sym'], r['sym'])
-                announcements = get_exchange_announcements(r['sym'])
-                if announcements:
-                    for item in announcements:
-                        st.markdown(f"• [{item['title']}]({item['link']})")
-                else:
-                    news = get_news(cn_name)
-                    if news:
-                        for item in news[:5]:
-                            title = item.get('title', '')
-                            link = item.get('link', '')
-                            if title and link:
-                                st.markdown(f"• [{title}]({link})")
-                            elif title:
-                                st.markdown(f"• {title}")
-                    else:
-                        ann_url = info.get('announce', '#')
-                        st.markdown(f"暂无最新公告，可点击 [交易所公告]({ann_url}) 查看")
+                st.subheader("📋 交易所公告")
+                ex_key = get_exchange_key(r['sym'])
+                ann_url = EXCHANGE_LINKS.get(ex_key, '#')
+                st.markdown(f"👉 [查看 {r['sym']} 所属交易所公告]({ann_url})")
 else:
     st.info("👆 点击「执行分析」开始")
