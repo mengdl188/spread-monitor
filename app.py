@@ -5,6 +5,9 @@ import numpy as np
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
+import requests
+import warnings
+warnings.filterwarnings('ignore')
 
 st.set_page_config(page_title="期货跨期套利监控", layout="wide")
 st.title("📊 期货跨期套利极端价差监控")
@@ -26,6 +29,26 @@ SYMBOL_MAP = {
     'PK': '花生', 'SH': '烧碱', 'PF': '短纤', 'PX': '对二甲苯',
     'SI': '工业硅', 'LC': '碳酸锂',
 }
+
+# 交易所与公告链接映射
+EXCHANGE_INFO = {
+    'SHFE': {'name': '上海期货交易所', 'announce': 'https://www.shfe.com.cn/news/notice/'},
+    'DCE': {'name': '大连商品交易所', 'announce': 'https://www.dce.com.cn/dalianshangpin/gywm/gsggx/csywgz/index.html'},
+    'CZCE': {'name': '郑州商品交易所', 'announce': 'https://www.czce.com.cn/cn/gywm/ggtg/csywgg/'},
+    'GFEX': {'name': '广州期货交易所', 'announce': 'https://www.gfex.com.cn/gfex/gywm/gsgg/'},
+}
+
+def get_exchange(sym):
+    """根据品种代码返回交易所简称"""
+    if sym in ('CU','AL','ZN','PB','NI','SN','AU','AG','RB','HC','SS','BU','RU','NR','SP','FU','SC','BC','AO','BR'):
+        return 'SHFE'
+    elif sym in ('C','CS','A','B','M','Y','P','L','V','PP','EB','EG','PG','JM','J','I','JD','LH','RR'):
+        return 'DCE'
+    elif sym in ('CF','CY','SR','TA','MA','OI','RM','RS','FG','SA','UR','SF','SM','AP','CJ','PK','SH','PF','PX'):
+        return 'CZCE'
+    elif sym in ('SI','LC'):
+        return 'GFEX'
+    return 'SHFE'
 
 COMMON_MONTHS = {
     'CU': range(1,13), 'AL': range(1,13), 'ZN': range(1,13), 'PB': range(1,13),
@@ -162,7 +185,8 @@ def get_historical_annual(sym, near_month, far_month):
         close_spread = df_a.loc[common, 'close'] - df_b.loc[common, 'close']
         daily_high = np.maximum(open_spread, close_spread)
         daily_low  = np.minimum(open_spread, close_spread)
-        pair_df = pd.DataFrame({'high': daily_high, 'low': daily_low}, index=common)
+        spread_series = (daily_high + daily_low) / 2
+        pair_df = pd.DataFrame({'high': daily_high, 'low': daily_low, 'spread': spread_series}, index=common)
         start = common.min() + timedelta(days=30)
         end   = common.max() - timedelta(days=15)
         if start >= end: continue
@@ -172,7 +196,7 @@ def get_historical_annual(sym, near_month, far_month):
         h = round(window['high'].max(), 2)
         l = round(window['low'].min(), 2)
         r = round(abs(h - l), 2)
-        records.append({'年份': y, '最高点': h, '最低点': l, '当年跨度': r})
+        records.append({'年份': y, '最高点': h, '最低点': l, '当年跨度': r, 'spread_mean': window['spread'].mean()})
     return records
 
 def analyze_spread(sym, near_code, far_code, threshold):
@@ -186,6 +210,7 @@ def analyze_spread(sym, near_code, far_code, threshold):
     daily_high = np.maximum(open_spread, close_spread)
     daily_low  = np.minimum(open_spread, close_spread)
     daily_close = close_spread.copy()
+    spread_series = (daily_high + daily_low) / 2
 
     start_cur = common.min() + timedelta(days=30)
     end_cur   = datetime.now()
@@ -215,6 +240,7 @@ def analyze_spread(sym, near_code, far_code, threshold):
         valid_annual = df_annual
         hist_mean = round(valid_annual['当年跨度'].mean(), 4)
         hist_max  = round(valid_annual['当年跨度'].max(), 4)
+        hist_spreads = pd.Series(dtype=float)
     else:
         df_annual = pd.DataFrame(annual_raw)
         historical = df_annual[df_annual['年份'] != current_year]
@@ -231,17 +257,26 @@ def analyze_spread(sym, near_code, far_code, threshold):
             valid_annual = historical[normal] if normal.sum() >= 2 else historical
             hist_mean = round(valid_annual['当年跨度'].mean(), 4)
             hist_max  = round(valid_annual['当年跨度'].max(), 4)
+        hist_spreads = historical['spread_mean'] if 'spread_mean' in historical.columns else pd.Series(dtype=float)
 
     alert = False
     if cur_range > 0 and (cur_range >= hist_mean*threshold or cur_range >= hist_max*threshold):
         alert = True
 
-    display = f"{SYMBOL_MAP.get(sym, sym)}({near_code}-{far_code})"
+    z_score = None
+    if not hist_spreads.empty:
+        mean_spread = hist_spreads.mean()
+        std_spread = hist_spreads.std()
+        if std_spread > 0:
+            z_score = round((cur_val - mean_spread) / std_spread, 2)
+
     cur_win_df = pd.DataFrame({
         'close': cur_close,
         'high': cur_high,
         'low': cur_low
     }, index=cur_close.index).sort_index()
+
+    display = f"{SYMBOL_MAP.get(sym, sym)}({near_code}-{far_code})"
 
     return {
         'display': display,
@@ -255,6 +290,7 @@ def analyze_spread(sym, near_code, far_code, threshold):
         'hist_mean': hist_mean,
         'hist_max': hist_max,
         'alert': alert,
+        'z_score': z_score,
         'annual': df_annual,
         'valid_annual': valid_annual,
         'spread_df': cur_win_df,
@@ -263,6 +299,86 @@ def analyze_spread(sym, near_code, far_code, threshold):
         'max_date': max_date.strftime('%Y-%m-%d'),
         'min_date': min_date.strftime('%Y-%m-%d')
     }
+
+# ------------------ 库存 -----------------
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_inventory_info(sym):
+    cn_name = SYMBOL_MAP.get(sym, sym)
+    try:
+        em_df = ak.futures_inventory_em(symbol=cn_name)
+        if em_df is not None and not em_df.empty:
+            if '日期' in em_df.columns: em_df.rename(columns={'日期': 'date'}, inplace=True)
+            if '库存' in em_df.columns: em_df.rename(columns={'库存': 'inventory'}, inplace=True)
+            if 'date' in em_df.columns and 'inventory' in em_df.columns:
+                em_df['date'] = pd.to_datetime(em_df['date'])
+                em_df = em_df.sort_values('date')
+                recent = em_df.tail(30)
+                if len(recent) >= 10:
+                    start_inv = recent['inventory'].iloc[0]
+                    end_inv = recent['inventory'].iloc[-1]
+                    if start_inv == 0 or end_inv == 0:
+                        return None
+                    pct = round((end_inv - start_inv) / start_inv * 100, 2) if start_inv != 0 else 0
+                    cur_year = datetime.now().year
+                    last_data = em_df[em_df['date'].dt.year == cur_year - 1]
+                    cur_avg = recent['inventory'].mean()
+                    last_avg = last_data['inventory'].mean() if not last_data.empty else cur_avg
+                    yoy = round((cur_avg - last_avg) / last_avg * 100, 2) if last_avg != 0 else 0
+                    if pct > 5: trend, risk = "📈 库存累积", "⚠️ 供给压力增大"
+                    elif pct < -5: trend, risk = "📉 库存去化", "✅ 供给偏紧"
+                    else: trend, risk = "➡️ 库存稳定", "⚪ 中性"
+                    return {'current': end_inv, 'change_30d': pct, 'yoy': yoy, 'trend': trend, 'risk': risk}
+    except:
+        pass
+    return None
+
+# ------------------ 交易所公告抓取 -----------------
+def get_exchange_announcements(sym):
+    """尝试抓取对应交易所公告标题，筛选含品种中文名的公告"""
+    cn_name = SYMBOL_MAP.get(sym, sym)
+    exchange = get_exchange(sym)
+    info = EXCHANGE_INFO.get(exchange)
+    if not info:
+        return None
+    url = info['announce']
+    try:
+        from bs4 import BeautifulSoup
+        resp = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+        resp.encoding = resp.apparent_encoding
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        titles = []
+        for a in soup.find_all('a', href=True):
+            text = a.get_text(strip=True)
+            if any(kw in text for kw in [cn_name, '仓单', '持仓限额', '交割', '调整']):
+                link = a['href']
+                if not link.startswith('http'):
+                    link = url.rstrip('/') + '/' + link.lstrip('/')
+                titles.append({'title': text, 'link': link})
+        if titles:
+            return titles[:5]
+    except:
+        pass
+    return None
+
+# ------------------ 新闻 (东方财富接口) -----------------
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_news(sym_name):
+    try:
+        url = "https://np-listapi.eastmoney.com/comm/web/getNewsByColumnId"
+        params = {
+            "columnId": "1023",
+            "pageNum": 1,
+            "pageSize": 5,
+            "keyword": sym_name
+        }
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(url, params=params, headers=headers, timeout=5)
+        data = resp.json()
+        if data.get('result') and data['result'].get('data'):
+            return data['result']['data']
+        return None
+    except:
+        return None
 
 # ------------------------------ 侧边栏 ------------------------------
 with st.sidebar:
@@ -275,12 +391,10 @@ with st.sidebar:
     else:
         filtered_syms = all_syms
 
-    # 收藏置顶排序
     display_syms = [sym for sym in filtered_syms if sym in st.session_state.favorites] + \
                    [sym for sym in filtered_syms if sym not in st.session_state.favorites]
 
     st.caption(f"匹配品种：{len(filtered_syms)} 个")
-
     st.divider()
 
     for sym in display_syms:
@@ -314,19 +428,14 @@ if st.button("🔄 执行分析", type="primary", use_container_width=True):
     else:
         with st.spinner("正在获取有效合约并分析……"):
             tasks = []
-            invalid_symbols = []
             for sym in st.session_state.selected_symbols:
                 codes = get_valid_contracts(sym)
-                if not codes:
-                    invalid_symbols.append(sym)
-                    continue
+                if not codes: continue
                 combos = generate_spreads(codes)
                 for n, f in combos:
                     tasks.append((sym, n, f))
-            if invalid_symbols:
-                st.warning(f"以下品种当前无有效合约: {', '.join(invalid_symbols)}")
             if not tasks:
-                st.error("所选品种当前均无满足条件的可交易合约")
+                st.error("所选品种当前没有满足条件的可交易合约")
             else:
                 results = []
                 progress = st.progress(0)
@@ -391,17 +500,113 @@ if st.session_state.results is not None:
                 st.write("**历年高低点明细**")
                 st.dataframe(r['annual'], use_container_width=True)
                 col_a, col_b = st.columns(2)
-                col_a.metric("有效年度均值跨度（不含今年）", r['hist_mean'])
+                col_a.metric("有效年度均值跨度", r['hist_mean'])
                 col_b.metric("历史最大跨度", r['hist_max'])
                 st.write("**历年跨度柱状图**")
                 st.bar_chart(r['annual'].set_index('年份')['当年跨度'])
-                st.write("**当前合约价差走势（收盘价差）**")
+                st.write("**当前合约价差走势**")
                 chart = r['spread_df'][['close']].copy()
                 chart.index = chart.index.strftime('%Y-%m-%d')
                 st.line_chart(chart)
-                if r['alert']:
-                    st.error("⚠️ 当前价差处于历史极端水平")
+
+                # ---------- 库存 ----------
+                st.write("---")
+                st.subheader("📊 库存")
+                inv = get_inventory_info(r['sym'])
+                if inv:
+                    ci1, ci2, ci3 = st.columns(3)
+                    ci1.metric("当前库存", f"{inv['current']}")
+                    ci2.metric("近30日变化", f"{inv['change_30d']}%")
+                    ci3.metric("同比", f"{inv['yoy']}%")
+                    st.caption(f"{inv['trend']}　|　{inv['risk']}")
                 else:
-                    st.success("✅ 价差偏离度正常")
+                    st.caption("暂无库存数据")
+
+                # ---------- 基本面链接 ----------
+                exchange = get_exchange(r['sym'])
+                info = EXCHANGE_INFO.get(exchange, {})
+                st.write("---")
+                st.subheader("🔗 基本面查询")
+                st.markdown(f"- 📋 [{info.get('name','')}仓单/库存/公告]({info.get('announce','#')})")
+
+                # ---------- 综合研判 ----------
+                st.write("---")
+                st.subheader("🎯 综合研判 (Z-score & 库存评分)")
+
+                z = r['z_score']
+                scores = {}
+
+                if z is not None:
+                    if abs(z) > 2.0:
+                        dev_score = 2
+                        dev_comment = "极度极端 (高回归拉力)"
+                    elif abs(z) > 1.5:
+                        dev_score = 1
+                        dev_comment = "较极端"
+                    else:
+                        dev_score = 0
+                        dev_comment = "正常"
+                    scores['价差偏离度'] = (dev_score, f"Z = {z:.2f}, {dev_comment}")
+                else:
+                    scores['价差偏离度'] = (0, "无历史数据")
+
+                direction = 0
+                if z is not None:
+                    direction = 1 if z > 0 else (-1 if z < 0 else 0)
+
+                if inv:
+                    pct = inv['change_30d']
+                    if pct > 5:
+                        inv_score = 1 if direction == 1 else (-1 if direction == -1 else 0)
+                        comm = f"近30日+{pct}%"
+                    elif pct < -5:
+                        inv_score = -1 if direction == 1 else (1 if direction == -1 else 0)
+                        comm = f"近30日{pct}%"
+                    else:
+                        inv_score = 0
+                        comm = f"近30日{pct}%"
+                    scores['库存'] = (inv_score, comm)
+                else:
+                    scores['库存'] = (0, "无数据")
+
+                total_score = sum(s for s, _ in scores.values())
+                if total_score >= 2: conclusion, color = "✅ 强支持回归", "green"
+                elif total_score >= 1: conclusion, color = "🟢 弱支持回归", "lightgreen"
+                elif total_score <= -2: conclusion, color = "🚫 强烈避险", "red"
+                elif total_score <= -1: conclusion, color = "⚠️ 需要警惕", "orange"
+                else: conclusion, color = "⚪ 信号中性", "grey"
+
+                for dim, (score, comment) in scores.items():
+                    scolor = "green" if score > 0 else ("red" if score < 0 else "gray")
+                    st.markdown(f"- **{dim}**: 得分 {score:+d} ({comment}) <span style='color:{scolor}'>{'↑支持回归' if score>0 else ('↓不支持回归' if score<0 else '—中性')}</span>", unsafe_allow_html=True)
+
+                st.write("---")
+                st.markdown(f"**综合得分: {total_score:+d}　{conclusion}**")
+                if color == 'red': st.error(conclusion)
+                elif color == 'orange': st.warning(conclusion)
+                elif color == 'green': st.success(conclusion)
+                else: st.info(conclusion)
+
+                # 新闻 / 公告
+                st.write("---")
+                st.subheader("📰 近期公告/新闻")
+                cn_name = SYMBOL_MAP.get(r['sym'], r['sym'])
+                announcements = get_exchange_announcements(r['sym'])
+                if announcements:
+                    for item in announcements:
+                        st.markdown(f"• [{item['title']}]({item['link']})")
+                else:
+                    news = get_news(cn_name)
+                    if news:
+                        for item in news[:5]:
+                            title = item.get('title', '')
+                            link = item.get('link', '')
+                            if title and link:
+                                st.markdown(f"• [{title}]({link})")
+                            elif title:
+                                st.markdown(f"• {title}")
+                    else:
+                        ann_url = info.get('announce', '#')
+                        st.markdown(f"暂无最新公告，可点击 [交易所公告]({ann_url}) 查看")
 else:
     st.info("👆 点击「执行分析」开始")
