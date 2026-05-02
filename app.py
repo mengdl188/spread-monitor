@@ -29,25 +29,6 @@ SYMBOL_MAP = {
     'SI': '工业硅', 'LC': '碳酸锂',
 }
 
-# 交易所固定链接
-EXCHANGE_LINKS = {
-    'SHFE': 'https://www.shfe.com.cn/news/notice/',
-    'DCE': 'https://www.dce.com.cn/dalianshangpin/gywm/gsggx/csywgz/index.html',
-    'CZCE': 'https://www.czce.com.cn/cn/gywm/ggtg/csywgg/',
-    'GFEX': 'https://www.gfex.com.cn/gfex/gywm/gsgg/',
-}
-
-def get_exchange_key(sym):
-    if sym in ('CU','AL','ZN','PB','NI','SN','AU','AG','RB','HC','SS','BU','RU','NR','SP','FU','SC','BC','AO','BR'):
-        return 'SHFE'
-    elif sym in ('C','CS','A','B','M','Y','P','L','V','PP','EB','EG','PG','JM','J','I','JD','LH','RR'):
-        return 'DCE'
-    elif sym in ('CF','CY','SR','TA','MA','OI','RM','RS','FG','SA','UR','SF','SM','AP','CJ','PK','SH','PF','PX'):
-        return 'CZCE'
-    elif sym in ('SI','LC'):
-        return 'GFEX'
-    return 'SHFE'
-
 COMMON_MONTHS = {
     'CU': range(1,13), 'AL': range(1,13), 'ZN': range(1,13), 'PB': range(1,13),
     'NI': range(1,13), 'SN': range(1,13), 'AU': range(1,13), 'AG': range(1,13),
@@ -262,9 +243,11 @@ def analyze_spread(sym, near_code, far_code, threshold):
         alert = True
 
     z_score = None
+    mean_spread = None
+    std_spread = None
     if not hist_spreads.empty:
-        mean_spread = hist_spreads.mean()
-        std_spread = hist_spreads.std()
+        mean_spread = round(hist_spreads.mean(), 2)
+        std_spread = round(hist_spreads.std(), 2)
         if std_spread > 0:
             z_score = round((cur_val - mean_spread) / std_spread, 2)
 
@@ -289,6 +272,8 @@ def analyze_spread(sym, near_code, far_code, threshold):
         'hist_max': hist_max,
         'alert': alert,
         'z_score': z_score,
+        'mean_spread': mean_spread,
+        'std_spread': std_spread,
         'annual': df_annual,
         'valid_annual': valid_annual,
         'spread_df': cur_win_df,
@@ -401,7 +386,24 @@ if st.button("🔄 执行分析", type="primary", use_container_width=True):
                         done += 1
                         progress.progress(done / len(futures))
                 sym_order = {s: i for i, s in enumerate(st.session_state.selected_symbols)}
-                results.sort(key=lambda x: (not x['alert'], sym_order.get(x['sym'],99), x['near_code']))
+
+                # 计算共振等级
+                for r in results:
+                    level = 0
+                    if r['alert'] and r['z_score'] is not None:
+                        if abs(r['z_score']) >= 2.0:
+                            level = 2   # 强共振
+                        elif abs(r['z_score']) >= 1.5:
+                            level = 1   # 次强共振
+                    r['resonance_level'] = level
+
+                # 排序：强共振 > 次强共振 > 单一跨度预警 > 正常
+                results.sort(key=lambda x: (
+                    -x['resonance_level'],
+                    not x['alert'],
+                    sym_order.get(x['sym'], 99),
+                    x['near_code']
+                ))
                 st.session_state.results = results
                 st.success(f"分析完成，有效组合 {len(results)} 个")
 
@@ -412,8 +414,20 @@ if st.session_state.results is not None:
     else:
         st.subheader("📋 跨期套利组合一览")
         for r in results:
-            alert_icon = '🔴' if r['alert'] else '🟢'
-            sym_name = SYMBOL_MAP.get(r['sym'], r['sym'])
+            # 根据共振等级决定图标和状态文字
+            if r['resonance_level'] == 2:
+                alert_icon = '🔥🔴'
+                status_text = "强共振 警惕"
+            elif r['resonance_level'] == 1:
+                alert_icon = '⚡🔴'
+                status_text = "次强共振 警惕"
+            elif r['alert']:
+                alert_icon = '🔴'
+                status_text = "⚠️ 预警请关注"
+            else:
+                alert_icon = '🟢'
+                status_text = "✅ 正常"
+
             cur_range = r['cur_range']
             hist_mean = r['hist_mean']
             hist_max = r['hist_max']
@@ -423,11 +437,6 @@ if st.session_state.results is not None:
             diff_mean_str = f"{diff_mean:+.2f}"
             diff_max_str  = f"{diff_max:+.2f}"
 
-            if r['alert']:
-                status_text = "⚠️ 预警请关注"
-            else:
-                status_text = "✅ 正常"
-
             summary = (
                 f"当前值 **{r['cur_val']}** | "
                 f"当前最高 **{r['cur_max']}** | "
@@ -435,9 +444,10 @@ if st.session_state.results is not None:
                 f"当前跨度 **{cur_range}** | "
                 f"历史均值 **{hist_mean}** (差 {diff_mean_str}) | "
                 f"历史最高 **{hist_max}** (差 {diff_max_str}) | "
+                f"Z **{r['z_score'] if r['z_score'] else '无'}** | "
                 f"{status_text}"
             )
-            header = f"{alert_icon} {sym_name} {r['near_code']}→{r['far_code']}  |  {summary}"
+            header = f"{alert_icon} {r['display']}  |  {summary}"
             with st.expander(header, expanded=False):
                 col1, col2, col3, col4 = st.columns(4)
                 col1.metric("期间最高", r['cur_max'])
@@ -459,7 +469,28 @@ if st.session_state.results is not None:
                 chart.index = chart.index.strftime('%Y-%m-%d')
                 st.line_chart(chart)
 
-                # ---------- 库存 ----------
+                # Z-score 解读
+                st.write("---")
+                st.subheader("📈 Z-score 偏离度分析")
+                if r['z_score'] is not None and r['mean_spread'] is not None and r['std_spread'] is not None:
+                    direction = "偏高" if r['z_score'] > 0 else "偏低"
+                    regress_dir = "向下回归 (价差缩小)" if r['z_score'] > 0 else "向上回归 (价差扩大)"
+                    col_z1, col_z2 = st.columns(2)
+                    col_z1.metric("历史均值价差", f"{r['mean_spread']}")
+                    col_z1.metric("标准差", f"{r['std_spread']}")
+                    col_z2.metric("当前价差", f"{r['cur_val']}", delta=f"{r['z_score']} Z")
+                    st.markdown(f"**当前价差 {direction} (Z = {r['z_score']})**")
+                    st.markdown(f"**回归方向: {regress_dir}**")
+                    if abs(r['z_score']) > 2.0:
+                        st.markdown("🔴 **极端偏离，回归拉力较强**")
+                    elif abs(r['z_score']) > 1.5:
+                        st.markdown("🟡 **较极端偏离**")
+                    else:
+                        st.markdown("🟢 **正常区间**")
+                else:
+                    st.markdown("历史数据不足，无法计算 Z-score")
+
+                # 库存
                 st.write("---")
                 st.subheader("📊 库存")
                 inv = get_inventory_info(r['sym'])
@@ -472,14 +503,12 @@ if st.session_state.results is not None:
                 else:
                     st.caption("暂无库存数据")
 
-                # ---------- 综合研判 ----------
+                # 综合研判
                 st.write("---")
-                st.subheader("🎯 综合研判 (Z-score & 库存评分)")
-
+                st.subheader("🎯 综合研判")
                 z = r['z_score']
                 scores = {}
-
-                if z is not None:
+                if z is not None and r['mean_spread'] is not None:
                     if abs(z) > 2.0:
                         dev_score = 2
                         dev_comment = "极度极端 (高回归拉力)"
@@ -529,12 +558,5 @@ if st.session_state.results is not None:
                 elif color == 'orange': st.warning(conclusion)
                 elif color == 'green': st.success(conclusion)
                 else: st.info(conclusion)
-
-                # 公告链接
-                st.write("---")
-                st.subheader("📋 交易所公告")
-                ex_key = get_exchange_key(r['sym'])
-                ann_url = EXCHANGE_LINKS.get(ex_key, '#')
-                st.markdown(f"👉 [查看 {r['sym']} 所属交易所公告]({ann_url})")
 else:
     st.info("👆 点击「执行分析」开始")
