@@ -2,6 +2,7 @@ import streamlit as st
 import akshare as ak
 import pandas as pd
 import numpy as np
+import altair as alt
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
@@ -151,6 +152,7 @@ def generate_spreads(codes):
 def get_historical_annual(sym, near_month, far_month):
     current_year = datetime.now().year
     records = []
+    yearly_series = {}          # 新增：保存各年份的价差日序列
     for y in range(current_year, current_year-6, -1):
         suffix = str(y)[2:]
         ca = f"{sym}{suffix}{near_month}"
@@ -176,7 +178,8 @@ def get_historical_annual(sym, near_month, far_month):
         l = round(window['low'].min(), 2)
         r = round(abs(h - l), 2)
         records.append({'年份': y, '最高点': h, '最低点': l, '当年跨度': r, 'spread_mean': window['spread'].mean()})
-    return records
+        yearly_series[y] = window['spread']   # 保存每日价差序列
+    return records, yearly_series
 
 def analyze_spread(sym, near_code, far_code, threshold):
     df_n = get_contract_df(near_code)
@@ -211,7 +214,7 @@ def analyze_spread(sym, near_code, far_code, threshold):
 
     near_month = near_code[-2:]
     far_month = far_code[-2:]
-    annual_raw = get_historical_annual(sym, near_month, far_month)
+    annual_raw, hist_yearly_series = get_historical_annual(sym, near_month, far_month)
     current_year = datetime.now().year
 
     if not annual_raw:
@@ -257,6 +260,10 @@ def analyze_spread(sym, near_code, far_code, threshold):
         'low': cur_low
     }, index=cur_close.index).sort_index()
 
+    # 构建历年价差序列字典（包括当前年份）
+    yearly_spreads = {yr: series for yr, series in hist_yearly_series.items()}
+    yearly_spreads[current_year] = cur_close  # 当前年份使用实际数据
+
     display = f"{SYMBOL_MAP.get(sym, sym)}({near_code}-{far_code})"
 
     return {
@@ -277,6 +284,7 @@ def analyze_spread(sym, near_code, far_code, threshold):
         'annual': df_annual,
         'valid_annual': valid_annual,
         'spread_df': cur_win_df,
+        'yearly_spreads': yearly_spreads,   # 新增
         'window_start': start_cur.strftime('%Y-%m-%d'),
         'window_end': end_cur.strftime('%Y-%m-%d'),
         'max_date': max_date.strftime('%Y-%m-%d'),
@@ -392,12 +400,11 @@ if st.button("🔄 执行分析", type="primary", use_container_width=True):
                     level = 0
                     if r['alert'] and r['z_score'] is not None:
                         if abs(r['z_score']) >= 2.0:
-                            level = 2   # 强共振
+                            level = 2
                         elif abs(r['z_score']) >= 1.5:
-                            level = 1   # 次强共振
+                            level = 1
                     r['resonance_level'] = level
 
-                # 排序：强共振 > 次强共振 > 单一跨度预警 > 正常
                 results.sort(key=lambda x: (
                     -x['resonance_level'],
                     not x['alert'],
@@ -414,7 +421,6 @@ if st.session_state.results is not None:
     else:
         st.subheader("📋 跨期套利组合一览")
         for r in results:
-            # 根据共振等级决定图标和状态文字
             if r['resonance_level'] == 2:
                 alert_icon = '🔥🔴'
                 status_text = "强共振 警惕"
@@ -464,10 +470,41 @@ if st.session_state.results is not None:
                 col_b.metric("历史最大跨度", r['hist_max'])
                 st.write("**历年跨度柱状图**")
                 st.bar_chart(r['annual'].set_index('年份')['当年跨度'])
-                st.write("**当前合约价差走势**")
-                chart = r['spread_df'][['close']].copy()
-                chart.index = chart.index.strftime('%Y-%m-%d')
-                st.line_chart(chart)
+
+                # ---------- 历年价差走势（新增）----------
+                st.write("**历年价差走势对比**")
+                yearly = r['yearly_spreads']
+                current_year = datetime.now().year
+                # 构建 DataFrame：日期、价差、年份、是否当前年
+                plot_data = []
+                for yr, series in yearly.items():
+                    if series.empty:
+                        continue
+                    temp_df = series.to_frame('spread')
+                    temp_df['year'] = str(yr)
+                    temp_df = temp_df.reset_index()
+                    temp_df.rename(columns={'index': 'date'}, inplace=True)
+                    plot_data.append(temp_df)
+                if plot_data:
+                    full_plot = pd.concat(plot_data, ignore_index=True)
+                    full_plot['is_current'] = full_plot['year'] == str(current_year)
+                    # 颜色：根据年份自动分配，但我们可以手动指定让当前年突出
+                    chart = alt.Chart(full_plot).mark_line().encode(
+                        x='date:T',
+                        y='spread:Q',
+                        color=alt.Color('year:N', legend=alt.Legend(title='年份')),
+                        strokeWidth=alt.condition(
+                            alt.datum.is_current == True,
+                            alt.value(3),
+                            alt.value(1.5)
+                        )
+                    ).properties(
+                        width=700,
+                        height=300
+                    ).interactive()
+                    st.altair_chart(chart, use_container_width=True)
+                else:
+                    st.caption("无历年走势数据")
 
                 # Z-score 解读
                 st.write("---")
