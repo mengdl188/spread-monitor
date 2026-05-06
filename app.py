@@ -6,6 +6,7 @@ import altair as alt
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
+import calendar
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -38,11 +39,12 @@ COMMON_MONTHS = {
     'NR': range(1,13), 'FU': range(1,13), 'SC': range(1,13), 'BC': range(1,13),
     'AO': range(1,13), 'BR': range(1,13), 'SP': [1,3,5,7,9,11],
     'C': [1,3,5,7,9,11], 'CS': [1,3,5,7,9,11], 'A': [1,3,5,7,9,11],
-    'B': [1,3,5,7,8,9,11], 'M': [1,3,5,7,8,9,11], 'Y': [1,3,5,7,8,9,11],
+    'B': [1,3,5,7,8,9,11], 'M': [1,3,5,7,8,9,11,12], 'Y': [1,3,5,7,8,9,11,12],
     'P': range(1,13), 'L': range(1,13), 'V': range(1,13), 'PP': range(1,13),
     'EB': range(1,13), 'EG': range(1,13), 'PG': range(1,13),
     'JM': range(1,13), 'J': range(1,13), 'I': range(1,13),
-    'JD': [1,2,3,4,5,6,9,10,11,12], 'LH': [1,3,5,7,9,11],
+    'JD': range(1,13),          # 鸡蛋调整为全年月份
+    'LH': [1,3,5,7,9,11],
     'RR': [1,3,5,7,9,11],
     'CF': [1,3,5,7,9,11], 'CY': [1,3,5,7,9,11], 'SR': [1,3,5,7,9,11],
     'TA': range(1,13), 'MA': range(1,13), 'OI': [1,3,5,7,9,11],
@@ -100,6 +102,13 @@ def get_contract_df(symbol):
     except:
         return None
 
+def get_contract_month(code):
+    """从合约代码中提取月份（整数）"""
+    try:
+        return int(code[-2:])
+    except:
+        return None
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_valid_contracts(sym):
     current = datetime.now()
@@ -110,7 +119,14 @@ def get_valid_contracts(sym):
             list_col = last_col = None
             for col in df.columns:
                 if '上市' in col: list_col = col
-                if '最后交易' in col or '最后交割' in col: last_col = col
+                if '最后交易' in col:
+                    last_col = col
+                    break
+            if last_col is None:
+                for col in df.columns:
+                    if '最后交割' in col:
+                        last_col = col
+                        break
             if list_col and last_col:
                 df[list_col] = pd.to_datetime(df[list_col])
                 df[last_col] = pd.to_datetime(df[last_col])
@@ -119,16 +135,25 @@ def get_valid_contracts(sym):
                     if not code.startswith(sym): continue
                     ld = row[list_col]; lt = row[last_col]
                     if pd.isna(ld) or pd.isna(lt): continue
-                    if (ld + timedelta(days=30)) <= current and 30 < (lt - current).days <= 210:
+                    # 过滤当月合约
+                    contract_month = get_contract_month(code)
+                    if contract_month == current.month:
+                        continue
+                    days_to_last = (lt - current).days
+                    if (ld + timedelta(days=30)) <= current and 30 < days_to_last <= 210:
                         valid.append(code)
     except:
         pass
     if valid:
         return sorted(set(valid))
 
+    # 回退路径：基于月份列表生成合约
     months = COMMON_MONTHS.get(sym, range(1,13))
     for year in [current.year, current.year + 1]:
         for m in months:
+            # 跳过当月合约
+            if year == current.year and m == current.month:
+                continue
             if year == current.year and m < current.month:
                 continue
             c_date = datetime(year, m, 1)
@@ -152,7 +177,7 @@ def generate_spreads(codes):
 def get_historical_annual(sym, near_month, far_month):
     current_year = datetime.now().year
     records = []
-    yearly_series = {}          # 新增：保存各年份的价差日序列
+    yearly_series = {}
     for y in range(current_year, current_year-6, -1):
         suffix = str(y)[2:]
         ca = f"{sym}{suffix}{near_month}"
@@ -178,7 +203,7 @@ def get_historical_annual(sym, near_month, far_month):
         l = round(window['low'].min(), 2)
         r = round(abs(h - l), 2)
         records.append({'年份': y, '最高点': h, '最低点': l, '当年跨度': r, 'spread_mean': window['spread'].mean()})
-        yearly_series[y] = window['spread']   # 保存每日价差序列
+        yearly_series[y] = window['spread']
     return records, yearly_series
 
 def analyze_spread(sym, near_code, far_code, threshold):
@@ -260,9 +285,8 @@ def analyze_spread(sym, near_code, far_code, threshold):
         'low': cur_low
     }, index=cur_close.index).sort_index()
 
-    # 构建历年价差序列字典（包括当前年份）
     yearly_spreads = {yr: series for yr, series in hist_yearly_series.items()}
-    yearly_spreads[current_year] = cur_close  # 当前年份使用实际数据
+    yearly_spreads[current_year] = cur_close
 
     display = f"{SYMBOL_MAP.get(sym, sym)}({near_code}-{far_code})"
 
@@ -284,7 +308,7 @@ def analyze_spread(sym, near_code, far_code, threshold):
         'annual': df_annual,
         'valid_annual': valid_annual,
         'spread_df': cur_win_df,
-        'yearly_spreads': yearly_spreads,   # 新增
+        'yearly_spreads': yearly_spreads,
         'window_start': start_cur.strftime('%Y-%m-%d'),
         'window_end': end_cur.strftime('%Y-%m-%d'),
         'max_date': max_date.strftime('%Y-%m-%d'),
@@ -475,7 +499,6 @@ if st.session_state.results is not None:
                 st.write("**历年价差走势对比**")
                 yearly = r['yearly_spreads']
                 current_year = datetime.now().year
-                # 构建 DataFrame：日期、价差、年份、是否当前年
                 plot_data = []
                 for yr, series in yearly.items():
                     if series.empty:
@@ -488,7 +511,6 @@ if st.session_state.results is not None:
                 if plot_data:
                     full_plot = pd.concat(plot_data, ignore_index=True)
                     full_plot['is_current'] = full_plot['year'] == str(current_year)
-                    # 颜色：根据年份自动分配，但我们可以手动指定让当前年突出
                     chart = alt.Chart(full_plot).mark_line().encode(
                         x='date:T',
                         y='spread:Q',
@@ -597,3 +619,4 @@ if st.session_state.results is not None:
                 else: st.info(conclusion)
 else:
     st.info("👆 点击「执行分析」开始")
+    
