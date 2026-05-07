@@ -43,7 +43,7 @@ COMMON_MONTHS = {
     'P': range(1,13), 'L': range(1,13), 'V': range(1,13), 'PP': range(1,13),
     'EB': range(1,13), 'EG': range(1,13), 'PG': range(1,13),
     'JM': range(1,13), 'J': range(1,13), 'I': range(1,13),
-    'JD': range(1,13),          # 鸡蛋调整为全年月份
+    'JD': range(1,13),
     'LH': [1,3,5,7,9,11],
     'RR': [1,3,5,7,9,11],
     'CF': [1,3,5,7,9,11], 'CY': [1,3,5,7,9,11], 'SR': [1,3,5,7,9,11],
@@ -103,7 +103,6 @@ def get_contract_df(symbol):
         return None
 
 def get_contract_month(code):
-    """从合约代码中提取月份（整数）"""
     try:
         return int(code[-2:])
     except:
@@ -135,7 +134,6 @@ def get_valid_contracts(sym):
                     if not code.startswith(sym): continue
                     ld = row[list_col]; lt = row[last_col]
                     if pd.isna(ld) or pd.isna(lt): continue
-                    # 过滤当月合约
                     contract_month = get_contract_month(code)
                     if contract_month == current.month:
                         continue
@@ -147,11 +145,9 @@ def get_valid_contracts(sym):
     if valid:
         return sorted(set(valid))
 
-    # 回退路径：基于月份列表生成合约
     months = COMMON_MONTHS.get(sym, range(1,13))
     for year in [current.year, current.year + 1]:
         for m in months:
-            # 跳过当月合约
             if year == current.year and m == current.month:
                 continue
             if year == current.year and m < current.month:
@@ -393,6 +389,15 @@ if st.button("🔄 执行分析", type="primary", use_container_width=True):
     if not st.session_state.selected_symbols:
         st.error("请先在左侧选择至少一个品种")
     else:
+        # 收盘后强制清除本地缓存文件，确保获取当天最新数据
+        now = datetime.now()
+        if now.hour >= 15:
+            for f in os.listdir(DATA_DIR):
+                if f.endswith('.csv'):
+                    os.remove(os.path.join(DATA_DIR, f))
+            st.cache_data.clear()
+        else:
+            st.cache_data.clear()
         with st.spinner("正在获取有效合约并分析……"):
             tasks = []
             for sym in st.session_state.selected_symbols:
@@ -419,7 +424,6 @@ if st.button("🔄 执行分析", type="primary", use_container_width=True):
                         progress.progress(done / len(futures))
                 sym_order = {s: i for i, s in enumerate(st.session_state.selected_symbols)}
 
-                # 计算共振等级
                 for r in results:
                     level = 0
                     if r['alert'] and r['z_score'] is not None:
@@ -495,7 +499,7 @@ if st.session_state.results is not None:
                 st.write("**历年跨度柱状图**")
                 st.bar_chart(r['annual'].set_index('年份')['当年跨度'])
 
-                # ---------- 历年价差走势（新增）----------
+                # ---------- 历年价差走势 ----------
                 st.write("**历年价差走势对比**")
                 yearly = r['yearly_spreads']
                 current_year = datetime.now().year
@@ -619,4 +623,3 @@ if st.session_state.results is not None:
                 else: st.info(conclusion)
 else:
     st.info("👆 点击「执行分析」开始")
-    
